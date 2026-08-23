@@ -1,0 +1,8 @@
+# ESP32-S3FN8 有 8MB Flash，默认分区表只给 app 1MB —— 带 WiFi 的固件已经吃掉
+# 720KB，再加点东西就爆了。这里给到 3MB，剩下的留作日后存录音/OTA。
+#
+# Name,     Type, SubType, Offset,   Size,  Flags
+nvs,        data, nvs,     0x9000,   0x6000,
+phy_init,   data, phy,     0xf000,   0x1000,
+factory,    app,  factory, 0x10000,  3M,
+storage,    data, fat,     ,         4M,

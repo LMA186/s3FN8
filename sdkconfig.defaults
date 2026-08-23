@@ -1,0 +1,33 @@
+# ---- ESP32-S3-Dongle v1.0g / ESP32-S3FN8  ESP-NOW 接收端配置 ----
+# 改完这个文件要删掉 sdkconfig 再重新 build 才会生效
+
+CONFIG_IDF_TARGET="esp32s3"
+
+# FN8 = 封装内置 8MB Quad Flash (DIO 80MHz 是官方推荐的稳妥组合)
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+
+# 本板没有 CH340/CP2102，USB 直连芯片的 GPIO19/20，
+# 日志和 PCM 都走内置 USB Serial/JTAG，否则串口什么都看不到
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+
+# 1ms 系统节拍。链路循环是 20ms 一拍，默认的 10ms tick 会让它抖到 ±10ms
+CONFIG_FREERTOS_HZ=1000
+
+# ---- WiFi / ESP-NOW ----
+# 只跑 ESP-NOW，不连路由器，不需要 DHCP/TCP 那一套。但音频是 50 包/秒 x 1288 字节，
+# 接收缓冲给足，否则 WiFi 任务来不及消化就会在 MAC 层直接丢包（统计里看不到）
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=16
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=32
+CONFIG_ESP_WIFI_TX_BUFFER_TYPE=1
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=16
+
+# 编译优化。默认是 -Og(调试)，这里是要跑实时音频流的，换成 -O2
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# ---- 分区表 ----
+# 默认表只给 app 1MB，本固件带 WiFi 已占 720KB。8MB 的 Flash 没必要这么挤
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"

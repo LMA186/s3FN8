@@ -13,9 +13,10 @@
 #include "esp_now.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#include "sdkconfig.h"   /* CONFIG_TUSB_PRODUCT：横幅里要报出电脑上看到的设备名 */
 
 #include "link_rx.h"
-#include "usb_stream.h"
+#include "uac_mic.h"
 
 static const char *TAG = "link";
 
@@ -221,10 +222,11 @@ static void on_recv_audio(const esp_now_recv_info_t *info, const uint8_t *data, 
 
     s_aud_rx++;
 
-    /* 空口序号原样带给电脑端：这样电脑端算出来的丢包是「端到端」的，
-     * 包含了 USB 这一段，而不只是空口那一段 */
-    usb_stream_send_pcm(hdr.seq, data + sizeof(audio_hdr_t),
-                        (size_t)hdr.samples * sizeof(int16_t));
+    /* 丢包在上面已经按序号统计过了。交给抖动缓冲之后，UAC 回调会按 USB
+     * 主机的节拍取走 —— 序号不用再往下带：UAC 是一条连续音频流，没有「包」
+     * 的概念，丢掉的那一段由欠载补静音来占位，时间轴才不会错位 */
+    uac_mic_push(data + sizeof(audio_hdr_t),
+                 (size_t)hdr.samples * sizeof(int16_t));
 }
 
 static void on_recv(const esp_now_recv_info_t *info, const uint8_t *data, int len)
@@ -331,17 +333,17 @@ static void io_init(void)
     gpio_config(&btn);
 }
 
-/* 蓝灯三种含义，隔着壳子也能看出链路状态：
- *   慢闪(1Hz)  还没找到麦克风端
- *   常亮       已配对，但电脑端没在取流
- *   快闪       正在往电脑推音频（每 10 包翻转一次，约 2.5Hz）
+/* 蓝灯三种含义。纯 UAC 方案下板子不再枚举出串口，隔着外壳就靠这盏灯判断：
+ *   慢闪(1Hz)  还没找到麦克风端 —— 看 NodeMCU 那块是不是没上电/信道不对
+ *   常亮       已配对，音频在收，但电脑没在录音
+ *   快闪       电脑正在录音，整条链路都通了（每 10 包翻转一次，约 2.5Hz）
  */
 static void led_update(uint32_t tick, bool paired, bool lost)
 {
     int level;
     if (!paired || lost) {
         level = (int)((tick / 25) & 1);          /* 25 x 20ms = 500ms */
-    } else if (!usb_stream_is_streaming()) {
+    } else if (!uac_mic_host_active()) {
         level = 1;
     } else {
         level = (int)((s_aud_rx / 10) & 1);
@@ -356,23 +358,25 @@ static void print_banner(void)
     uint32_t nowver = 0;
     esp_now_get_version(&nowver);
 
-    usb_stream_printf("\n");
-    usb_stream_printf("=================================================\n");
-    usb_stream_printf("  ESP32-S3-Dongle  ESP-NOW 无线麦克风接收端\n");
-    usb_stream_printf("=================================================\n");
-    usb_stream_printf("  本机 MAC   : %02X:%02X:%02X:%02X:%02X:%02X\n",
+    printf("\n");
+    printf("=================================================\n");
+    printf("  ESP32-S3-Dongle  ESP-NOW 无线麦克风 -> USB 声卡\n");
+    printf("=================================================\n");
+    printf("  本机 MAC   : %02X:%02X:%02X:%02X:%02X:%02X\n",
            s_self_mac[0], s_self_mac[1], s_self_mac[2],
            s_self_mac[3], s_self_mac[4], s_self_mac[5]);
-    usb_stream_printf("  WiFi 信道  : %d  (必须和 espnow_duo 的 LINK_CHANNEL 一致)\n", LINK_CHANNEL);
-    usb_stream_printf("  ESP-NOW    : v%" PRIu32 "%s\n", nowver,
+    printf("  WiFi 信道  : %d  (必须和 espnow_duo 的 LINK_CHANNEL 一致)\n", LINK_CHANNEL);
+    printf("  ESP-NOW    : v%" PRIu32 "%s\n", nowver,
            (nowver >= 2) ? "" : "  << 只有 v1! 1288 字节的音频包会被丢，需要 IDF>=5.4");
-    usb_stream_printf("  音频格式   : %d Hz / %d 声道交织 / int16 小端 / 每包 %d 帧\n",
+    printf("  空口格式   : %d Hz / %d 声道交织 / int16 小端 / 每包 %d 帧\n",
            LINK_SAMPLE_RATE, LINK_MIC_CHANNELS, LINK_FRAMES_PKT);
-    usb_stream_printf("-------------------------------------------------\n");
-    usb_stream_printf("  蓝灯: 慢闪=找不到发送端  常亮=已配对  快闪=正在推流\n");
-    usb_stream_printf("  电脑端取流: python tools/recv_audio.py\n");
-    usb_stream_printf("             (工具连上后会自动发 S 命令开始推流)\n");
-    usb_stream_printf("=================================================\n\n");
+    printf("  USB 身份   : %s  (UAC 1.0, Windows 免驱)\n", CONFIG_TUSB_PRODUCT);
+    printf("-------------------------------------------------\n");
+    printf("  蓝灯: 慢闪=找不到发送端  常亮=已配对  快闪=电脑正在录音\n");
+    printf("  电脑端: 录音软件里选「%s」当输入设备，不需要任何脚本\n",
+           CONFIG_TUSB_PRODUCT);
+    printf("  这条日志走的是 UART0 (GPIO43/44，在 J1 排针上)\n");
+    printf("=================================================\n\n");
 }
 
 /* ---------------- 主循环 ---------------- */
@@ -412,8 +416,6 @@ static void link_task(void *arg)
         rx_lost        = s_rx_lost;
         portEXIT_CRITICAL(&s_mux);
 
-        bool quiet = usb_stream_is_streaming();   /* 推流期间串口上不能有文字 */
-
         /* ---- 配对 ---- */
         if (pending_pair && !paired) {
             esp_err_t err = add_unicast_peer(pending_mac);
@@ -423,12 +425,11 @@ static void link_task(void *arg)
                 s_paired = true;
                 portEXIT_CRITICAL(&s_mux);
                 paired = true;
-                if (!quiet) {
-                    usb_stream_printf("\n>>> 配对成功! 麦克风端 %02X:%02X:%02X:%02X:%02X:%02X  RSSI %d dBm\n",
-                           s_peer_mac[0], s_peer_mac[1], s_peer_mac[2],
-                           s_peer_mac[3], s_peer_mac[4], s_peer_mac[5], rssi);
-                    usb_stream_printf(">>> 对端马上开始发音频\n\n");
-                }
+                printf("\n>>> 配对成功! 麦克风端 %02X:%02X:%02X:%02X:%02X:%02X  RSSI %d dBm\n",
+                       s_peer_mac[0], s_peer_mac[1], s_peer_mac[2],
+                       s_peer_mac[3], s_peer_mac[4], s_peer_mac[5], rssi);
+                printf(">>> 音频开始流入，电脑录音软件里选「%s」即可\n\n",
+                       CONFIG_TUSB_PRODUCT);
                 /* 配对本身就是「从无到有」，别让下面的失联判定再报一次「链路恢复」 */
                 was_lost = false;
             } else {
@@ -440,12 +441,13 @@ static void link_task(void *arg)
         bool    lost = !paired || (now - last_rx_us > LOST_US);
 
         if (lost && !was_lost) {
-            if (!quiet) {
-                usb_stream_printf("\n!!! 麦克风端失联\n\n");
-            }
+            printf("\n!!! 麦克风端失联，电脑那边从现在起只能录到静音\n\n");
             s_aud_seq_valid = false;   /* 重连后序号会跳，别把这一跳算成丢包 */
-        } else if (!lost && was_lost && paired && !quiet) {
-            usb_stream_printf("\n>>> 链路恢复\n\n");
+            /* 缓冲里剩的是断线前的陈音频。留着不清，恢复之后它会一直顶在
+             * 队首，延迟再也降不回来 —— 必须连同起播水位一起重来 */
+            uac_mic_flush();
+        } else if (!lost && was_lost && paired) {
+            printf("\n>>> 链路恢复\n\n");
         }
         was_lost = lost;
 
@@ -472,21 +474,23 @@ static void link_task(void *arg)
 
         /* ---- BOOT 键：不接电脑时也能确认固件活着 ---- */
         bool down = (gpio_get_level(BTN_GPIO) == 0);
-        if (down && !btn_down && !quiet) {
-            usb_stream_printf("\n[按键] 当前 %s，推流由电脑端工具控制\n\n",
-                   usb_stream_is_streaming() ? "推流中" : "空闲");
+        if (down && !btn_down) {
+            printf("\n[按键] 缓冲%dms | 电脑%s | 欠载%" PRIu32 " 追帧%" PRIu32 "\n\n",
+                   uac_mic_depth_ms(),
+                   uac_mic_host_active() ? "正在录音" : "没在录音",
+                   uac_mic_underruns(), uac_mic_catchups());
         }
         btn_down = down;
 
         led_update(tick, paired, lost);
 
         /* ---- 串口状态行 ---- */
-        if (!quiet && tick % PRINT_EVERY == 0) {
+        if (tick % PRINT_EVERY == 0) {
             if (!paired) {
-                usb_stream_printf(" 正在广播寻找麦克风端... (信道 %d) —— 给那块 NodeMCU 上电，"
+                printf(" 正在广播寻找麦克风端... (信道 %d) —— 给那块 NodeMCU 上电，"
                        "或检查两边信道是否一致\n", LINK_CHANNEL);
             } else if (lost) {
-                usb_stream_printf(" !! 已 %.1f 秒收不到麦克风端 (最后 RSSI %d dBm)，广播重连中...\n",
+                printf(" !! 已 %.1f 秒收不到麦克风端 (最后 RSSI %d dBm)，广播重连中...\n",
                        (double)(now - last_rx_us) / 1e6, rssi);
             } else {
                 uint32_t total   = rx_ok + rx_lost;
@@ -498,10 +502,11 @@ static void link_task(void *arg)
                 size_t n = 0;
                 n += snprintf(line + n, sizeof(line) - n,
                               " 音频 收%" PRIu32 " 空口丢%" PRIu32 " 非法%" PRIu32
-                              " | USB 发%" PRIu32 " 满丢%" PRIu32
+                              " | 缓冲%3dms 欠载%" PRIu32 " 追帧%" PRIu32 " 满丢%" PRIu32
                               " | RSSI%4d 心跳%5.1f%%",
                               s_aud_rx, s_aud_lost, s_aud_bad,
-                              usb_stream_frames(), usb_stream_drops(),
+                              uac_mic_depth_ms(), uac_mic_underruns(),
+                              uac_mic_catchups(), uac_mic_drops(),
                               rssi, hb_rate);
                 if (remote_has_mic && n < sizeof(line)) {
                     n += snprintf(line + n, sizeof(line) - n,
@@ -514,10 +519,10 @@ static void link_task(void *arg)
                 } else if (n < sizeof(line)) {
                     n += snprintf(line + n, sizeof(line) - n, "  << 远端没有麦克风!");
                 }
-                if (!usb_stream_is_streaming() && n < sizeof(line)) {
-                    snprintf(line + n, sizeof(line) - n, "   [电脑端未取流]");
+                if (!uac_mic_host_active() && n < sizeof(line)) {
+                    snprintf(line + n, sizeof(line) - n, "   [电脑没在录音]");
                 }
-                usb_stream_printf("%s\n", line);
+                printf("%s\n", line);
             }
         }
     }
@@ -539,7 +544,7 @@ esp_err_t link_rx_start(void)
         return err;
     }
 
-    /* 优先级 4：低于 USB 推流任务(5)。钉在 core1，core0 留给 WiFi */
+    /* 优先级 4：低于组件里的 UAC 任务(5)。钉在 core1，core0 留给 WiFi */
     if (xTaskCreatePinnedToCore(link_task, "link", 4096, NULL, 4, NULL, 1) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }

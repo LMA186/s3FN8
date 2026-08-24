@@ -1,0 +1,12 @@
+## usb_device_uac 已经 vendor 到本工程的 components/usb_device_uac/
+##
+## 为什么不直接用组件仓库的版本：0.2.0 在 MIC 声道数 != 1 时会生成非法描述符
+## （bNrChannels=2 但 bmChannelConfig 只有 1 个 bit），Windows 的 usbaudio2.sys
+## 直接拒绝启动。修改点见 components/usb_device_uac/tusb/uac_config.h 里
+## 标了「本地修改 #1」的那段。组件的 CMakeLists 把 tusb/ 硬编码进 TinyUSB 的
+## include 路径，没办法从外面覆盖，只能整个 vendor 进来改。
+##
+## tinyusb_src 和 cmake_utilities 由那个本地组件自己的 idf_component.yml 拉取。
+dependencies:
+  idf:
+    version: ">=5.3"

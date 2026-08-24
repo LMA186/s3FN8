@@ -1,4 +1,4 @@
-# ---- ESP32-S3-Dongle v1.0g / ESP32-S3FN8  ESP-NOW 接收端配置 ----
+# ---- ESP32-S3-Dongle v1.0g / ESP32-S3FN8  ESP-NOW 无线麦克风 -> USB 声卡 ----
 # 改完这个文件要删掉 sdkconfig 再重新 build 才会生效
 
 CONFIG_IDF_TARGET="esp32s3"
@@ -8,13 +8,46 @@ CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
 CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
 CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
 
-# 本板没有 CH340/CP2102，USB 直连芯片的 GPIO19/20，
-# 日志和 PCM 都走内置 USB Serial/JTAG，否则串口什么都看不到
-CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+# ---- 控制台 ----
+# 芯片只有一套 USB PHY，跑起来之后归 TinyUSB(USB-OTG) 所有，
+# USB Serial/JTAG 那条 CDC 就没了，日志只能改走 UART0(GPIO43/44，在 J1 排针上)。
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200
+
+# 这一条极易漏：主控制台设成 UART 之后，"次要控制台"默认仍然是 USB Serial/JTAG，
+# 它会去初始化那个外设，和 TinyUSB 抢同一套 PHY。必须显式关掉。
 CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
 
 # 1ms 系统节拍。链路循环是 20ms 一拍，默认的 10ms tick 会让它抖到 ±10ms
 CONFIG_FREERTOS_HZ=1000
+
+# ---- USB UAC 设备 ----
+# UAC 1.0，Windows 用系统自带的 usbaudio.sys 认，免驱。
+# 只做麦克风，不做扬声器（SPEAKER_CHANNEL_NUM=0 会把整条播放链路编译掉）
+CONFIG_UAC_MIC_CHANNEL_NUM=2
+CONFIG_UAC_SPEAKER_CHANNEL_NUM=0
+CONFIG_UAC_SAMPLE_RATE=16000
+
+# 主机每次取走 10ms。往大调能减少回调次数，但会顶高端到端延迟；
+# 往小调延迟低，可组件那个 usb_mic_task 是紧循环，调用太频繁反而费 CPU
+CONFIG_UAC_MIC_INTERVAL_MS=10
+
+# 这一项是给 macOS 用的（16.16 转 10.14 格式）。开了之后 Windows 反而认不了，
+# 组件 README 明说两者不能同时兼容。我们的目标是 Windows，保持关闭
+CONFIG_UAC_SUPPORT_MACOS=n
+
+# TinyUSB 和取数任务都钉在 core1，把 core0 整个让给 WiFi/ESP-NOW
+CONFIG_UAC_TINYUSB_TASK_CORE=1
+CONFIG_UAC_MIC_TASK_CORE=1
+
+# ---- USB 描述符 ----
+# PID 必须和之前 CDC 方案的 0x1001 不同。Windows 按 VID:PID 缓存设备描述符，
+# 同一个 PID 从 CDC 变成音频类，大概率变成「无法识别的设备」，还得手工清缓存
+CONFIG_TUSB_VID=0x303A
+CONFIG_TUSB_PID=0x8001
+CONFIG_TUSB_MANUFACTURER="Espressif"
+CONFIG_TUSB_PRODUCT="ESP-NOW Wireless Mic"
+CONFIG_TUSB_SERIAL_NUM="S3FN8-DONGLE-01"
 
 # ---- WiFi / ESP-NOW ----
 # 只跑 ESP-NOW，不连路由器，不需要 DHCP/TCP 那一套。但音频是 50 包/秒 x 1288 字节，
@@ -28,6 +61,6 @@ CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=16
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
 
 # ---- 分区表 ----
-# 默认表只给 app 1MB，本固件带 WiFi 已占 720KB。8MB 的 Flash 没必要这么挤
+# 默认表只给 app 1MB，本固件带 WiFi + TinyUSB 已接近 800KB。8MB 的 Flash 没必要这么挤
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"

@@ -1,14 +1,15 @@
-# ESP32-S3-Dongle —— ESP-NOW 无线麦克风接收端 → USB
+# ESP32-S3-Dongle —— ESP-NOW 无线麦克风 → 免驱 USB 声卡
 
 把 NodeMCU-32S（`lua-esp32/espnow_duo`）通过 ESP-NOW 发来的麦克风音频收下来，
-原样通过 USB 送到电脑。
+**把自己伪装成一只标准 USB 麦克风**交给电脑。插上就能在 Windows 录音设备列表里
+看到，不用装驱动、不用跑任何脚本。
 
 ```
-INMP441 x2 ──I2S──> NodeMCU-32S ──ESP-NOW 信道1──> S3 Dongle ──USB CDC──> 电脑
-                    (espnow_duo)                  (本工程)          recv_audio.py
+INMP441 x2 ──I2S──> NodeMCU-32S ──ESP-NOW 信道1──> S3 Dongle ──USB UAC1.0──> 电脑
+                    (espnow_duo)                   (本工程)      「ESP-NOW Wireless Mic」
 ```
 
-音频格式：**16 kHz / 双声道交织 / int16 小端**，每包 320 帧 × 2 路，50 包/秒，512 kbps。
+音频格式：**16 kHz / 双声道 / int16**，空口每包 320 帧 × 2 路，50 包/秒，512 kbps。
 
 ---
 
@@ -16,11 +17,12 @@ INMP441 x2 ──I2S──> NodeMCU-32S ──ESP-NOW 信道1──> S3 Dongle �
 
 | 项目 | 连线 | 说明 |
 |---|---|---|
-| **蓝灯 D3** | `GPIO1 → R3(1K) → 阳极`，阴极接 GND | 高电平点亮，用来指示链路状态 |
-| **按键 S1** | `GPIO0 → S1 → GND` | BOOT 键，兼作状态查询 |
-| **USB** | `GPIO19(D-) / GPIO20(D+)` 直连 USB-A | **板上没有串口芯片**，走 S3 内置 USB Serial/JTAG |
+| **蓝灯 D3** | `GPIO1 → R3(1K) → 阳极`，阴极接 GND | 高电平点亮。**纯 UAC 方案下这是唯一的现场状态指示** |
+| **按键 S1** | `GPIO0 → S1 → GND` | BOOT 键，兼作状态查询（打一行到 UART0） |
+| **USB** | `GPIO19(D-) / GPIO20(D+)` 直连 USB-A | 正是芯片内部 USB PHY 的引出脚，硬件无需任何改动 |
+| **UART0** | `GPIO43(TX) / GPIO44(RX)` → J1 排针 | 日志出口。不接也不影响功能 |
 | **复位** | 无复位键 | 复位 = 拔插 USB |
-| **芯片** | ESP32-S3FN8，内置 8MB Flash，无 PSRAM | 分区表给了 app 3MB（默认 1MB 不够，固件已 720KB） |
+| **芯片** | ESP32-S3FN8，内置 8MB Flash，无 PSRAM | 分区表给 app 3MB，当前固件 726KB |
 
 ---
 
@@ -52,185 +54,282 @@ INMP441 x2 ──I2S──> NodeMCU-32S ──ESP-NOW 信道1──> S3 Dongle �
 
 ---
 
-## 三、USB 上的数据怎么走
+## 三、为什么能做成免驱麦克风
 
-同一条 CDC 链路既要走人看的中文日志、又要走机器读的二进制 PCM，做法是：
+ESP32-S3 内部只有**一套** USB PHY，两个控制器抢它（IDF `hal/usb_phy_types.h`）：
 
-- **默认只打日志，不推流。** `idf.py monitor` 当普通串口用，看状态一切正常。
-- 电脑端工具连上后发一个字节 `'S'`，固件才开始推流，同时把日志级别压成 `NONE`，
-  链路上就只剩纯净的二进制帧。发 `'X'` 停流并恢复日志。
-- 每帧带同步字 + 长度 + **CRC16-CCITT**，电脑端可以从任意字节重新对齐。
-
-帧格式（[main/usb_stream.h](main/usb_stream.h) 与
-[tools/recv_audio.py](tools/recv_audio.py) 必须一致）：
-
-```
-偏移  长度  含义
-0     2     同步字 0xA5 0x5A
-2     1     帧类型  0x01=PCM  0x10=INFO(开流第一帧，含采样率/声道数)
-3     1     通道数
-4     2     seq，小端 —— 直接沿用空口音频包号，电脑端据此算端到端丢包
-6     2     payload 字节数，小端
-8     2     payload 的 CRC16-CCITT，小端
-10    N     payload
+```c
+typedef enum {
+    USB_PHY_CTRL_OTG,          /* 跑 TinyUSB，能做任意 USB 设备 */
+    USB_PHY_CTRL_SERIAL_JTAG,  /* 固定就是个 CDC 串口 */
+} usb_phy_controller_t;
 ```
 
-> 为什么不能只靠同步字：中文日志是 UTF-8，续字节里可能偶然出现 `0xA5`。
-> 所以电脑端必须连长度和 CRC 一起复核才认帧。
+而这套 PHY 的引出脚就是原理图上那两根：
+
+```c
+#define USBPHY_DP_NUM 20   /* D+ */
+#define USBPHY_DM_NUM 19   /* D- */
+```
+
+所以硬件一点不用改，只要把 PHY 交给 OTG、descriptor 声明成 **UAC 1.0**，
+Windows 就用系统自带的 `usbaudio.sys` 认它，全程免驱。
+
+用的组件是 [`espressif/usb_device_uac`](https://components.espressif.com/components/espressif/usb_device_uac)
+v0.2.0（内部封装 TinyUSB）。
+
+> 它发的是 **UAC 2.0** 描述符（`bFunctionProtocol=0x20`），Windows 挂的是
+> `usbaudio2.sys`，同样免驱（Win10 1703+ 起内置），不是 UAC 1.0 的 `usbaudio.sys`。
+
+### 组件在多声道下有 bug，已 vendor 到本地修好
+
+**没有**直接用仓库版本，而是拷进了 [components/usb_device_uac/](components/usb_device_uac/)。
+
+原因：0.2.0 把麦克风的 `bmChannelConfig` 硬编码成 `AUDIO_CHANNEL_CONFIG_FRONT_CENTER`
+（`0x00000004`，只有 1 个 bit），而 `bNrChannels` 用的是 `MIC_CHANNEL_NUM`。
+只有 `MIC_CHANNEL_NUM==1` 时两者才自洽。
+
+设成 2 之后描述符就变成**「声明 2 个声道，但声道位图只标了 1 个」**，
+Windows 的 `usbaudio2.sys` 对这个一致性检查很严，直接拒绝启动：
+
+```
+Status       : Error
+FriendlyName : usb uac
+ProblemCode  : 10   (CM_PROB_FAILED_START)
+Service      : usbaudio2
+```
+
+现象是设备管理器里一个带感叹号的「usb uac」，而**录音设备列表里什么都不出现**。
+（上游在扬声器那条路径上用的是 `NON_PREDEFINED`，正因为声道数可变；麦克风这条漏了。）
+
+修改在 [components/usb_device_uac/tusb/uac_config.h](components/usb_device_uac/tusb/uac_config.h)
+里标了「本地修改 #1」的那段，按声道数给出自洽的位图：
+
+| 声道数 | bmChannelConfig |
+|---|---|
+| 1 | `FRONT_CENTER` （保持上游行为）|
+| 2 | `FRONT_LEFT｜FRONT_RIGHT` = `0x03`（正经立体声，Windows 会标 L/R）|
+| 其它 | `NON_PREDEFINED` = `0x00`（对任意 bNrChannels 都合法）|
+
+组件的 `CMakeLists.txt` 把 `tusb/` 硬编码进了 TinyUSB 的 include 路径，
+没办法从工程外面覆盖，所以只能整个 vendor 进来。
+
+### 本地修改 #2：麦克风的 Feature Unit 控制请求根本没实现
+
+改完 #1 之后**症状一模一样**（还是代码 10），但这次描述符是完全合规的
+——145 字节逐字段核对过，`wTotalLength`、CS_AC 的 `wTotalLength=64`
+(9+8+17+12+18)、端点 `wMaxPacketSize=0x44`、`bInterval=1` 全都对。
+问题在控制端点上：
+
+```c
+// usb_device_uac.c，上游原样
+static bool tud_audio_feature_unit_get_request(...)
+{
+    TU_ASSERT(request->bEntityID == UAC2_ENTITY_SPK_FEATURE_UNIT);   // 只认扬声器 0x02
+    ...
+}
+
+bool tud_audio_get_req_entity_cb(...)
+{
+    if (request->bEntityID == UAC2_ENTITY_CLOCK)            { ... }  // 0x04
+    if (request->bEntityID == UAC2_ENTITY_SPK_FEATURE_UNIT) { ... }  // 0x02
+    else { /* 返回 false */ }
+}
+```
+
+而描述符里麦克风的 Feature Unit 是 **`UAC2_ENTITY_MIC_FEATURE_TERMINAL` = 0x12**，
+并且 `MIC_CTRL` 把静音和音量都声明成了「主机可编程」(`0x0000000F`)。于是：
+
+```
+Windows 向实体 0x12 查音量
+  → 掉进 else，返回 false
+  → TinyUSB STALL 掉这个控制请求
+  → usbaudio2.sys 启动失败，CM_PROB_FAILED_START
+```
+
+**声明了控制项却不实现**——这个 bug 和声道数无关，纯麦克风配置下必然触发。
+
+顺带修掉一个越界：`mute[]` / `volume[]` 原来按 `N_CHANNELS_TX`（扬声器声道数）定长，
+关掉扬声器之后只有 1 个元素，而麦克风有 master+2 共 3 个通道，
+按 `bChannelNumber` 索引会写到结构体后面的字段上去。
+
+修改点在 [components/usb_device_uac/usb_device_uac.c](components/usb_device_uac/usb_device_uac.c)
+里标了「本地修改 #2」的 5 处：两个分发器、两个 `TU_ASSERT`、数组定长改成
+`UAC_MAX_FU_CHANNELS = max(TX, RX)`。
+
+> 目前音量/静音是**收下但不生效**的（Windows 的滑块会动，但不改变实际增益），
+> 增益在 NodeMCU 那一侧调。要让滑块真正起作用的话，把 `set_volume_cb`
+> 接到 [main/uac_mic.c](main/uac_mic.c) 里在 `input_cb` 出口乘一个系数即可。
+
+### 排查这类问题的通用方法
+
+代码 10 只说明「驱动起不来」，不区分是描述符非法还是控制请求被拒。分辨方法：
+
+- **描述符问题** → 从 ELF 里挖出来逐字段核对（见上）
+- **控制请求问题** → 描述符核对无误却仍然失败，就去看固件里所有
+  `tud_audio_*_cb` 的返回路径，任何一条返回 `false` 都会变成 STALL
+
+改完可以直接从 ELF 里挖描述符自查：
+
+```bash
+objdump -t build/espnow_usb_mic.elf | grep desc_configuration
+objdump -s -j .flash.rodata --start-address=0x<上面的地址> --stop-address=0x<+0x91> build/espnow_usb_mic.elf
+```
+
+Input Terminal(4.7.2.4) 应该长这样 —— `bNrChannels=02` 后面紧跟 `bmChannelConfig=03 00 00 00`：
+
+```
+11 24 02 11 01 02 13 04 | 02 | 03 00 00 00 | 00 04 00 00
+```
+
+### 代价
+
+| 失去的 | 补偿 |
+|---|---|
+| USB Serial/JTAG 那个 COM 口 | 日志改走 **UART0**（GPIO43/44，J1 排针），接个 USB-TTL 就能看 |
+| `idf.py monitor` 走 USB | 同上；不接串口就看蓝灯 |
+| 之前的 `tools/recv_audio.py` | 作废了，已删除。需要的话 `git checkout e758070 -- tools/` 找回 |
 
 ---
 
-## 四、烧录
+## 四、时钟漂移怎么处理（[main/uac_mic.c](main/uac_mic.c)）
 
-### 1. 编译
+采样时钟在 NodeMCU 的 I2S 上，播放时钟在电脑的 USB 主机上，两边晶振各
+±10~20ppm，跑久了必然一边撑满一边抽干。三条水位线兜住：
 
-VSCode 里点状态栏 🔨，或者命令行：
+| 水位 | 值 | 作用 |
+|---|---|---|
+| `PREBUF_MS` | 100 ms | 攒够才开始交付，给网络抖动留垫子 |
+| `HIGH_WATER_MS` | 250 ms | 超过就丢一整块追延迟（发送端偏快） |
+| 欠载 | — | 没数据就交静音并计数（发送端偏慢或丢包） |
+| `JITTER_MS` | 400 ms | 缓冲总容量 |
+
+**和 `voice_assistant` 那版不同的一点**：那边的消费方是 AFE，`feed()` 比实时快得多，
+会把缓冲一路抽干，所以必须自己维护绝对时间轴。这里的消费方是 USB 等时端点，
+主机每 10ms 雷打不动只要 10ms 的量，**天然就是实时节拍**，在回调里阻塞等数据
+就等于被主机定速了，不需要额外的时间轴。
+
+⚠️ 组件的 `usb_mic_task` 是个**没有 delay 的紧循环**，节拍完全由 `input_cb` 自己把握。
+所以 [uac_mic.c](main/uac_mic.c) 里每条返回路径都保证要么阻塞在
+`xStreamBufferReceive`、要么显式 `vTaskDelay` —— 无条件立刻返回会让那个任务空转吃满一个核。
+
+---
+
+## 五、烧录（**方式变了，仔细看**）
+
+固件跑起来之后 PHY 归 TinyUSB，**COM 口消失**，电脑上看到的是一只麦克风。
+但 ROM 下载模式用的是 USB Serial/JTAG 控制器，所以还有路走：
+
+1. **按住板上的 S1 键不放**
+2. 把 dongle 插进 USB 口
+3. 过 1 秒松手 —— 此时芯片停在 ROM 下载模式，COM 口重新出现
+4. 烧录：
 
 ```powershell
 cd d:\AI-Voice-recognition-hardware-main\s3FN8
-.\idf.ps1 build
+.\idf.ps1 -p COMx flash          # COMx 换成重新出现的那个口
 ```
 
-> `idf.ps1` 是本工程自带的助手。你系统 PATH 上有个 Python 3.8.6，官方
-> `export.ps1` 会抓到它并报 `ESP-IDF supports Python 3.9 or newer` 直接失败，
-> 这个脚本绕开了它。VSCode 扩展用的是自带的 3.11，不受影响。
+5. 烧完**拔下来再插上**（这块板没有复位键），程序开始跑，
+   电脑上就多出一只麦克风了。
 
-### 2. 插板 + 选口
+> `idf.ps1` 绕开了系统 PATH 上那个 Python 3.8.6（它会让官方 `export.ps1` 直接报错退出）。
 
-插上 dongle，设备管理器里会多出一个 **`USB 串行设备 (COMx)`**（VID `303A`，PID `1001`），
-Windows 11 自带驱动。VSCode 状态栏点 🔌 选它。
-
-> 别选 COM8/COM9 那种「蓝牙链接上的标准串行」，那是蓝牙虚拟口。
-
-### 3. 烧录
-
-VSCode 点 🔥（Build + Flash + Monitor），或 `Ctrl+E` 再按 `D`。命令行：
-
-```powershell
-.\idf.ps1 -p COM5 flash monitor      # COM5 换成实际的口
-```
-
-**分区表变了，第一次烧必须整片烧**（`flash` 命令本来就是三个 bin 一起写，
-包含 partition-table.bin，所以正常操作即可）。若之前烧过自检程序，
-保险起见可以先擦干净：
-
-```powershell
-.\idf.ps1 -p COM5 erase-flash
-.\idf.ps1 -p COM5 flash monitor
-```
-
-### 4. 连不上时（本板没有复位键）
-
-1. **按住 S1 不放**
-2. 插进 USB 口
-3. 过 1 秒松开
-4. 芯片停在 ROM 下载模式，重新点烧录
-
-烧完**拔下来再插上**（这板子只能这样复位）。
-
-> USB Serial/JTAG 固化在 ROM 里，Flash 空的或程序写坏了 COM 口照样出现，
-> 基本变不了砖。
-
-### 5. 退出监视器
-
-`Ctrl+]`
+VSCode 里用 ESP-IDF 扩展也一样：先手动进下载模式，再点 ⚡ Flash。
 
 ---
 
-## 五、电脑端取流
+## 六、电脑端怎么用
 
-```powershell
-pip install pyserial
+**不需要任何脚本。** 插上之后：
 
-cd d:\AI-Voice-recognition-hardware-main\s3FN8\tools
-python recv_audio.py                    # 自动找口，录成 rec_时间戳.wav
-python recv_audio.py -o test.wav -t 10  # 录 10 秒
-python recv_audio.py --list             # 只列串口
-python recv_audio.py -p COM5            # 手动指定口
-python recv_audio.py --play             # 边收边放(需 pip install sounddevice)
-```
+- 设备管理器 → 声音、视频和游戏控制器 → 多出 **`ESP-NOW Wireless Mic`**
+- 设置 → 系统 → 声音 → 输入 → 选它
+- 任何录音软件（录音机 / Audacity / 浏览器 / 微信 / ASR 程序）直接选这个输入设备
 
-直接管道给别的程序（裸 PCM 到 stdout，状态行走 stderr）：
+VID:PID = `303A:8001`。**故意和之前 CDC 方案的 `303A:1001` 错开** ——
+Windows 按 VID:PID 缓存设备描述符，同一个 PID 从 CDC 变成音频类，
+大概率变成「无法识别的设备」，还得手工清缓存。
 
-```powershell
-python recv_audio.py -o - | ffplay -f s16le -ar 16000 -ch_layout stereo -i -
-```
-
-运行时的状态行：
-
-```
- 录   12.3s | 包   615 丢    2 ( 99.7%) CRC错   0 重同步   0 | L[########------------] -38.2  R[########------------] -37.9 dBFS
-```
-
-- **丢** 是端到端丢包（空口 + USB 都算在内），靠 seq 差值推算
-- 默认丢包处**补静音**，保证 WAV 时长和真实时间对得上；`--no-fill` 可关掉
-- **L/R 两条电平条**应该跟得很紧（1~3dB 以内）。长期差 10dB 以上说明对端
-  有一只麦被挡住或虚焊
-
-`Ctrl+C` 停止，脚本会发 `'X'` 让固件恢复日志，并把 WAV 收尾写好。
+格式是 **16 kHz 立体声**。两路来自间距 5cm 的双 INMP441 阵列，
+ch0 = 左槽（L/R→GND），ch1 = 右槽（L/R→3V3）。要做波束成形/降噪的话素材是全的；
+只想要单声道就在录音软件里降混。
 
 ---
 
-## 六、怎么判断跑通了
+## 七、蓝灯含义（没接串口时唯一的状态来源）
 
-### 蓝灯
+| 现象 | 含义 | 该查什么 |
+|---|---|---|
+| **1Hz 慢闪** | 还没找到麦克风端 | NodeMCU 是不是没上电；两边信道是否都是 1 |
+| **常亮** | 已配对、音频在收，但电脑没在录音 | 正常。在电脑上打开录音软件即可 |
+| **快闪** | 电脑正在录音，整条链路都通了 | 正常工作状态 |
+| **不亮** | 固件没跑起来 | 按住 S1 重插进下载模式，重新烧录 |
 
-| 现象 | 含义 |
-|---|---|
-| 500ms 慢闪 | 还没找到麦克风端（对端没上电 / 信道不一致） |
-| **常亮** | 已配对，链路在线，但电脑端没在取流 |
-| 快闪 | 正在往电脑推音频 |
+---
 
-### 串口（`idf.py monitor`，未取流时）
+## 八、看日志（可选）
+
+接个 USB-TTL 到 J1 排针的 `TXD0` / `GND`，115200 8N1：
 
 ```
+=================================================
+  ESP32-S3-Dongle  ESP-NOW 无线麦克风 -> USB 声卡
+=================================================
+  本机 MAC   : XX:XX:XX:XX:XX:XX
+  WiFi 信道  : 1  (必须和 espnow_duo 的 LINK_CHANNEL 一致)
+  ESP-NOW    : v2
+  空口格式   : 16000 Hz / 2 声道交织 / int16 小端 / 每包 320 帧
+  USB 身份   : ESP-NOW Wireless Mic  (UAC 1.0, Windows 免驱)
+=================================================
+
 >>> 配对成功! 麦克风端 XX:XX:XX:XX:XX:XX  RSSI -42 dBm
->>> 对端马上开始发音频
-
- 音频 收2451 空口丢3 非法0 | USB 发0 满丢0 | RSSI -42 心跳100.0%  远端 全频-45dB 带内-52dB   [电脑端未取流]
+ 音频 收 615 空口丢 2 非法 0 | 缓冲 118ms 欠载 0 追帧 0 满丢 0 | RSSI -42 心跳 99.7%  远端 音量 34 全频-38dB 带内-41dB
 ```
 
-- **空口丢** 涨得快 → RSSI 太低或信道拥挤，换 6/11 信道试试（两边都要改）
-- **非法** 非 0 → 包结构对不上，多半是对端固件版本不一致
-- **USB 满丢** 涨 → 电脑端读得太慢，缓冲被灌满
-- **削顶 x%** 出现 → 对端增益给多了，调高它的 `PCM_GAIN_SHIFT`
+判读：
+
+| 字段 | 正常 | 异常说明 |
+|---|---|---|
+| `缓冲` | 100~250ms 之间浮动 | 长期贴 250 = 发送端偏快；长期接近 0 = 偏慢/丢包 |
+| `欠载` | 不涨 | 持续涨 = 空口丢包严重，或对端 I2S 供数不足 |
+| `追帧` | 偶尔 +1 | 频繁涨 = 两边时钟差得多，属正常补偿 |
+| `满丢` | 0 | 非 0 = 电脑没在取数但空口还在灌 |
+| `心跳` | >95% | 偏低 = 信号差，换信道或缩短距离 |
+| `削顶` | 不出现 | 出现就去调对端的 `PCM_GAIN_SHIFT` |
 
 ---
 
-## 七、常见问题
-
-| 现象 | 原因 / 处理 |
-|---|---|
-| 一直「正在广播寻找麦克风端」 | 对端没上电；或两边信道不一致（本端 `LINK_CHANNEL`，对端 `CONFIG_LINK_CHANNEL`，都要是 1） |
-| 报「对端协议 vN，本机 v3」 | `espnow_duo` 那块板烧的是旧固件，一起重烧 |
-| 报「收到 N 字节状态包，本机要 11 字节」 | 同上，包结构改过 |
-| 报「对端发的是单声道音频」 | 对端 `MIC_CHANNELS` 不是 2，检查它的 `mic.h` |
-| banner 里 ESP-NOW 是 v1 | IDF 版本太老，1288 字节的包会被丢。本工程用 5.5.5 不会 |
-| 脚本说找不到 303A:1001 | dongle 没插好，或换根能传数据的 USB 线（有些线只有电） |
-| 脚本状态行一直 0 包 | 蓝灯是不是常亮？不常亮说明空口那段就没通，先解决配对 |
-| CRC错 / 重同步 一直涨 | USB 线质量差，或电脑端处理太慢导致固件端写超时 |
-| 录出来左右声道对调 | 对端两只 INMP441 的 L/R 脚接反了（ch0 应接 GND，ch1 接 3V3） |
-| 改了 `sdkconfig.defaults` 不生效 | 删掉工程里的 `sdkconfig` 再重新编译 |
-| `main.c` 里 `#include` 全是红波浪线 | 先 Build 一次生成 `build/compile_commands.json`，再 `Ctrl+Shift+P → C/C++: Reset IntelliSense Database` |
-
----
-
-## 八、工程结构
+## 九、工程结构
 
 ```
 s3FN8/
-├── CMakeLists.txt                  工程入口
-├── partitions.csv                  自定义分区表(app 3MB，默认 1MB 装不下)
-├── sdkconfig.defaults              板级默认配置
-├── idf.ps1                         命令行编译烧录助手(绕过 Python 3.8 冲突)
-├── .vscode/
-│   ├── settings.json               ESP-IDF 扩展配置
-│   ├── c_cpp_properties.json       IntelliSense 配置
-│   └── extensions.json             推荐扩展
-├── main/
-│   ├── main.c                      启动流程
-│   ├── link_rx.c / .h              ESP-NOW 接收 + 配对 + 心跳 + LED 指示
-│   └── usb_stream.c / .h           USB 帧封装 + 推流任务 + 命令解析
-└── tools/
-    └── recv_audio.py               电脑端取流/存 WAV/电平监视
+├── CMakeLists.txt              工程入口
+├── partitions.csv              app 给到 3MB（默认 1MB 不够）
+├── sdkconfig.defaults          板级 + UAC + 控制台改 UART0
+├── idf.ps1                     命令行助手（绕过 Python 3.8 冲突）
+├── .vscode/                    ESP-IDF 扩展 + IntelliSense 配置
+├── components/
+│   └── usb_device_uac/         vendor 自 espressif/usb_device_uac 0.2.0
+│                               改了多声道的 bmChannelConfig，见第三节
+└── main/
+    ├── idf_component.yml       只声明 IDF 版本（UAC 组件已 vendor 到上面）
+    ├── main.c                  启动顺序
+    ├── link_rx.c/.h            ESP-NOW 收音频 + 心跳 + 配对 + LED
+    └── uac_mic.c/.h            抖动缓冲 + UAC 取数回调
 ```
+
+---
+
+## 十、常见问题
+
+| 现象 | 原因 / 处理 |
+|---|---|
+| 插上去没有麦克风，也没有 COM 口 | 固件没跑。按住 S1 重插进下载模式重烧 |
+| 显示「无法识别的 USB 设备」 | Windows 缓存了旧描述符。换个 USB 口，或设备管理器里卸载后重插 |
+| 设备管理器里有带感叹号的「usb uac」，代码 10 | 描述符不合法，**或**某个控制请求被 STALL 了。见第三节的两处本地修改和排查方法 |
+| 麦克风有了，但录出来全是静音 | 蓝灯是慢闪 = 没配对。检查 NodeMCU 上电、两边信道都是 1 |
+| 录音断断续续 | 看 UART 日志的 `欠载`；空口丢包严重就换信道或缩短距离 |
+| 声音有明显延迟 | 正常，约 130~150ms（20ms 空口包 + 100ms 起播 + USB）。调低 `PREBUF_MS` 可减少，代价是抗抖动变差 |
+| 改了 `sdkconfig.defaults` 不生效 | 删掉 `sdkconfig` 再重新编译 |
+| 想回到之前的 CDC 推流方案 | `git checkout e758070` |

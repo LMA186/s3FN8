@@ -442,12 +442,21 @@ bool tud_audio_tx_done_pre_load_cb(uint8_t rhport, uint8_t itf, uint8_t ep_in, u
     }
 
     // load data chunk by chunk
+    bool consumed = false;
     UAC_ENTER_CRITICAL();
     if (s_uac_device->mic_data_size > 0) {
         tud_audio_write((void *)s_uac_device->mic_buf_read, s_uac_device->mic_data_size);
         s_uac_device->mic_data_size = 0;
+        consumed = true;
     }
     UAC_EXIT_CRITICAL();
+
+    /* 交接位空出来了，放生产者去做下一块。
+     * 这一路（每 USB 帧一次、腾出整块空间才搬走）才是这条链路真正的时钟，
+     * usb_mic_task 必须跟着它走，详见那边的注释 */
+    if (consumed) {
+        xTaskNotifyGive(s_uac_device->mic_task_handle);
+    }
 
     return true;
 }
@@ -483,6 +492,27 @@ static void usb_mic_task(void *pvParam)
             ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
             continue;
         }
+        /* 反压：上一块还没被 USB 帧回调取走，就先别生产下一块。
+         *
+         * 没有这一步的话，这个 while(1) 是个不带任何节流的死循环，而
+         * mic_data_size 只是一格交接位 —— input_cb 只要连着两次很快返回
+         * （数据源是突发的就一定会，比如 ESP-NOW 每 20ms 送来正好 2 块），
+         * 后一块就会把还没送出去的前一块直接覆盖掉。表现是恒定丢 50%：
+         * 电脑端收到的音频「响 10ms、哑 10ms」，而设备侧所有计数器都正常，
+         * 因为丢包发生在这里、在上游任何统计的下游。
+         *
+         * 超时是兜底：主机停止录音后 tx_done 回调不再触发，没有它这里会永远卡住 */
+        {
+            bool pending;
+            UAC_ENTER_CRITICAL();
+            pending = (s_uac_device->mic_data_size > 0);
+            UAC_EXIT_CRITICAL();
+            if (pending) {
+                ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(MIC_INTERVAL_MS * 4 + 5));
+                continue;
+            }
+        }
+
         // clear the notification
         // read data from the microphone chunk by chunk
         size_t bytes_require = MIC_INTERVAL_MS * s_uac_device->mic_bytes_per_ms;

@@ -1,4 +1,5 @@
 #include <inttypes.h>
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -108,6 +109,47 @@ static uint32_t s_aud_bad;       /* 长度/通道数不合法而丢弃 */
 static uint16_t s_aud_last_seq;
 static bool     s_aud_seq_valid;
 
+/* ---------------- 送给电脑之前的数字增益 ----------------
+ *
+ * 为什么这里必须有一级增益：发送端的 PCM_GAIN_SHIFT 定在 16，也就是把 24 位
+ * 满量程一对一映射到 int16 —— 那个档位的好处是「数学上不可能削顶」，代价是
+ * 电平很低，正常说话在电脑上只有 -35dBFS 上下，录音软件里几乎看不见波形。
+ *
+ * 这条链路原本还有一级补偿：PCM 以前是发给 esp32s3 语音板的，那边
+ * afe_config.afe_linear_gain = 4.0 把电平抬回 +12dB 才喂给 WakeNet。
+ * 现在换成 USB 声卡，从麦克风到电脑整条路上再没有任何自动增益，
+ * 那 12dB 就得在这里补回来。
+ *
+ * Q8 定点，256 = ×1 不动：
+ *     256 = ×1  ( 0dB)      2048 = ×8  (+18dB)
+ *     512 = ×2  (+6dB)      4096 = ×16 (+24dB)  <- 当前
+ *    1024 = ×4  (+12dB)     8192 = ×32 (+30dB)
+ *
+ * 「理论最大值」在这条链路上不是一个常数，它由现场实际的最大声压决定：
+ * 增益前峰值离满量程还剩多少 dB，就最多还能加多少 dB，加过头就是削顶。
+ * 这个余量随环境差得很远，espnow_duo/main/mic.c 里记着两组实测：
+ *     安静办公室正常说话   峰值约 -24dBFS  ->  最多 +24dB (×16)
+ *     嘈杂现场（风机/电机） 峰值 -10 ~ -5dBFS ->  最多约 +5dB (×1.8)
+ * 差了将近 20dB。所以这里定 4096 是「按办公室那组数顶到上限」，
+ * 换到吵的地方必须往回退 —— 不要把它当成一个放之四海皆准的值。
+ *
+ * 判据不用估，串口每秒直接给：
+ *     增益x16.0 峰值-24dB 上限x11.2
+ *   「峰值」= 本秒增益前的实测峰值，「上限」= 由它反推、留 3dB 余量的最大倍数。
+ *   实测上限低于当前档位，或者打出「USB削顶x%」，就往回退一档。
+ *
+ * 注意这是纯数字增益：信号和噪声同等倍数放大，改善不了信噪比一分一毫，
+ * 唯一作用是把工作点挪到电脑那头合适的位置，挪过头的唯一后果就是削顶。
+ * 真要提高信噪比只能从声学下手（离得近一点、避开噪声源）*/
+#define UAC_GAIN_Q8   4096
+
+/* 增益侧的统计。和上面几个一样：只在回调里写、主循环里读，
+ * s_peak16 由主循环读完清零 —— 中间那一瞬可能丢掉一个采样点的峰值，
+ * 对「每秒看一眼余量」这个用途完全无所谓，不值得为它加锁 */
+static uint32_t s_gain_clip;     /* 累计被钳位的采样点 */
+static uint32_t s_gain_n;        /* 累计过增益的采样点，用来算占比 */
+static uint32_t s_peak16;        /* 本秒增益前的绝对值峰值，满量程 32768 */
+
 /* ---------------- ESP-NOW 回调 ---------------- */
 
 static void on_recv_status(const esp_now_recv_info_t *info, const uint8_t *data, int len)
@@ -181,6 +223,7 @@ static void on_recv_audio(const esp_now_recv_info_t *info, const uint8_t *data, 
      * 否则写出去的 PCM 会错开半帧，电脑端从此左右声道对调 */
     size_t need = sizeof(audio_hdr_t) + (size_t)hdr.samples * sizeof(int16_t);
     if (hdr.samples == 0 || need != (size_t)len ||
+        hdr.samples > LINK_FRAMES_PKT * LINK_MIC_CHANNELS ||
         (hdr.samples % LINK_MIC_CHANNELS) != 0) {
         s_aud_bad++;
         return;
@@ -225,8 +268,46 @@ static void on_recv_audio(const esp_now_recv_info_t *info, const uint8_t *data, 
     /* 丢包在上面已经按序号统计过了。交给抖动缓冲之后，UAC 回调会按 USB
      * 主机的节拍取走 —— 序号不用再往下带：UAC 是一条连续音频流，没有「包」
      * 的概念，丢掉的那一段由欠载补静音来占位，时间轴才不会错位 */
-    uac_mic_push(data + sizeof(audio_hdr_t),
-                 (size_t)hdr.samples * sizeof(int16_t));
+    /* 落到自己的缓冲上再处理：ESP-NOW 给的 data 是只读的，而且回调一返回就
+     * 失效。这个函数只在 WiFi 任务里跑、独此一处调用，所以 static 不用担心
+     * 重入 —— 1280 字节放栈上太奢侈。先整包 memcpy 过来再就地处理，
+     * 顺便回避了 data+8 强转 int16_t* 的对齐问题。
+     * 上面已经卡死 samples <= LINK_FRAMES_PKT*LINK_MIC_CHANNELS，不会写越界 */
+    static int16_t gained[LINK_FRAMES_PKT * LINK_MIC_CHANNELS];
+
+    memcpy(gained, data + sizeof(audio_hdr_t),
+           (size_t)hdr.samples * sizeof(int16_t));
+
+    uint32_t peak = s_peak16;
+
+    for (size_t i = 0; i < hdr.samples; i++) {
+        int32_t x = gained[i];
+
+        /* 增益之前先量峰值 —— 这是反推「还能加多少」的唯一依据。
+         * 必须取在钳位之前：钳过之后所有大信号都长成一个样，
+         * 就再也看不出到底超了多少 */
+        uint32_t a = (uint32_t)(x < 0 ? -x : x);
+        if (a > peak) {
+            peak = a;
+        }
+
+        int32_t v = (x * UAC_GAIN_Q8) >> 8;
+        /* 必须钳位：int16 溢出是数值翻转，一个大正样点会变成大负样点，
+         * 听感上是爆音，比削顶本身难听得多 */
+        if (v > 32767) {
+            v = 32767;
+            s_gain_clip++;
+        } else if (v < -32768) {
+            v = -32768;
+            s_gain_clip++;
+        }
+        gained[i] = (int16_t)v;
+    }
+
+    s_peak16 = peak;
+    s_gain_n += hdr.samples;
+
+    uac_mic_push(gained, (size_t)hdr.samples * sizeof(int16_t));
 }
 
 static void on_recv(const esp_now_recv_info_t *info, const uint8_t *data, int len)
@@ -370,6 +451,9 @@ static void print_banner(void)
            (nowver >= 2) ? "" : "  << 只有 v1! 1288 字节的音频包会被丢，需要 IDF>=5.4");
     printf("  空口格式   : %d Hz / %d 声道交织 / int16 小端 / 每包 %d 帧\n",
            LINK_SAMPLE_RATE, LINK_MIC_CHANNELS, LINK_FRAMES_PKT);
+    printf("  数字增益   : x%.2f (%+.1f dB)  UAC_GAIN_Q8=%d @ link_rx.c\n",
+           UAC_GAIN_Q8 / 256.0, 20.0 * log10(UAC_GAIN_Q8 / 256.0), UAC_GAIN_Q8);
+    printf("               状态行的「上限x?」是实测出来的档位天花板，比当前档位低就要往回退\n");
     printf("  USB 身份   : %s  (UAC 1.0, Windows 免驱)\n", CONFIG_TUSB_PRODUCT);
     printf("-------------------------------------------------\n");
     printf("  蓝灯: 慢闪=找不到发送端  常亮=已配对  快闪=电脑正在录音\n");
@@ -518,6 +602,32 @@ static void link_task(void *arg)
                     }
                 } else if (n < sizeof(line)) {
                     n += snprintf(line + n, sizeof(line) - n, "  << 远端没有麦克风!");
+                }
+                /* 增益档位的实测依据。「上限」= 让本秒峰值正好顶到 int16 满量程、
+                 * 再留 3dB 余量的最大倍数：它小于当前档位就说明已经在削了 */
+                uint32_t pk = s_peak16;
+                s_peak16 = 0;
+                if (pk > 0 && n < sizeof(line)) {
+                    float pk_db = 20.0f * log10f((float)pk / 32768.0f);
+                    float max_x = powf(10.0f, (-pk_db - 3.0f) / 20.0f);
+                    n += snprintf(line + n, sizeof(line) - n,
+                                  "  增益x%.1f 峰值%.0fdB 上限x%.1f",
+                                  UAC_GAIN_Q8 / 256.0, (double)pk_db, (double)max_x);
+                }
+
+                /* 本机增益的削顶，按「本秒新增」算而不是累计值：累计值一旦
+                 * 被某次意外碰响就再也回不到 0，看不出当前档位合不合适 */
+                if (n < sizeof(line)) {
+                    static uint32_t last_clip, last_n;
+                    uint32_t clip = s_gain_clip, gn = s_gain_n;
+                    uint32_t dc = clip - last_clip, dn = gn - last_n;
+                    last_clip = clip;
+                    last_n    = gn;
+                    if (dc > 0 && dn > 0) {
+                        n += snprintf(line + n, sizeof(line) - n,
+                                      "  << USB削顶%" PRIu32 "%%! 降 UAC_GAIN_Q8",
+                                      (uint32_t)((100 * dc) / dn));
+                    }
                 }
                 if (!uac_mic_host_active() && n < sizeof(line)) {
                     snprintf(line + n, sizeof(line) - n, "   [电脑没在录音]");

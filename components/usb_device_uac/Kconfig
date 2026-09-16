@@ -20,6 +20,22 @@ menu "USB Device UAC Configuration"
         string "Product ID"
         default "12345678"
 
+    # ===== 本地修改 #3：HID 键盘接口 =====
+    config UAC_HID_KEY
+        bool "复合一个 HID 键盘接口（对端唤醒键 -> 电脑空格键）"
+        default y
+        help
+            打开后这个 dongle 在电脑上除了是一只麦克风，还是一只键盘：
+            对端 espnow_duo 那块板上的唤醒键（GPIO4）按一下，
+            电脑就收到一次空格键。
+
+            空格在电脑上本来就有现成语义（播放暂停 / PPT 翻页 / 浏览器滚动），
+            所以不用在电脑上装任何软件就能看到现象。
+
+            关掉的话 USB 描述符退回纯 UAC，和加这个功能之前完全一致。
+            排查 Windows 枚举问题（设备管理器里的黄色感叹号、代码 10）时，
+            先关掉这一项看问题还在不在 —— 见 README 第三节记的两次描述符踩坑。
+
     choice TINYUSB_RHPORT
         prompt "TinyUSB PHY"
         default TINYUSB_RHPORT_HS if IDF_TARGET_ESP32P4

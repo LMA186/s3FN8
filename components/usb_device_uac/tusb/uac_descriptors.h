@@ -31,6 +31,9 @@ extern "C" {
 
 #include "uac_config.h"
 
+/* 接口号必须从 0 连续排下去，中间不能有洞，所以 HID 只能挂在音频接口后面。
+ * 音频那几个接口的编号一个没动 —— 它们被 IAD 关联在一起，编号变了
+ * Windows 会把整个音频功能认成另一个设备 */
 enum {
     ITF_NUM_AUDIO_CONTROL = 0,
 #if SPEAK_CHANNEL_NUM
@@ -39,6 +42,9 @@ enum {
 #if MIC_CHANNEL_NUM
     ITF_NUM_AUDIO_STREAMING_MIC,
 #endif // MIC_CHANNEL_NUM
+#if UAC_HID_KEY_ENABLE
+    ITF_NUM_HID,            /* 本地修改 #3 */
+#endif
     ITF_NUM_TOTAL
 };
 

@@ -47,6 +47,10 @@ CONFIG_TUSB_VID=0x303A
 CONFIG_TUSB_PID=0x8001
 CONFIG_TUSB_MANUFACTURER="Espressif"
 CONFIG_TUSB_PRODUCT="ESP-NOW Wireless Mic"
+
+# 复合一个 HID 键盘接口：对端 espnow_duo 的唤醒键(GPIO4) -> 电脑收到一次空格键。
+# 关掉就退回纯 UAC 描述符，排查 Windows 枚举问题时先关这个。
+CONFIG_UAC_HID_KEY=y
 CONFIG_TUSB_SERIAL_NUM="S3FN8-DONGLE-01"
 
 # ---- WiFi / ESP-NOW ----

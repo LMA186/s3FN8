@@ -11,6 +11,16 @@ extern "C" {
 
 #include "sdkconfig.h"
 
+/* 本地修改 #3：HID 键盘接口的总开关。
+ * 用 #ifndef 包一层是为了让工程能用编译参数覆盖它，不必改这个 vendored 文件 */
+#ifndef UAC_HID_KEY_ENABLE
+#  ifdef CONFIG_UAC_HID_KEY
+#    define UAC_HID_KEY_ENABLE  1
+#  else
+#    define UAC_HID_KEY_ENABLE  0
+#  endif
+#endif
+
 #define SPEAK_CHANNEL_NUM    CONFIG_UAC_SPEAKER_CHANNEL_NUM  /*!< SPEAKER */
 #define MIC_CHANNEL_NUM      CONFIG_UAC_MIC_CHANNEL_NUM      /*!< MIC */
 #define DEFAULT_SAMPLE_RATE  CONFIG_UAC_SAMPLE_RATE          /*!< SAMPLE RATE */

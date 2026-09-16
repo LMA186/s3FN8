@@ -9,6 +9,10 @@
  *   INMP441 x2 ──I2S──> NodeMCU-32S ──ESP-NOW 信道1──> 本板 ──USB UAC1.0──> 电脑
  *   16kHz / 双声道交织 / int16，空口每包 320 帧 x 2 路，50 包/秒，512 kbps
  *
+ * 除了麦克风，本板在电脑上还是一只【键盘】：对端那块板的唤醒键(GPIO4)按一下，
+ * 电脑就收到一次空格键（播放暂停 / PPT 翻页都能直接用）。见 hid_key.c。
+ * 不想要的话 menuconfig 里关掉 CONFIG_UAC_HID_KEY，描述符就退回纯 UAC。
+ *
  * 板子相关（依据原理图）：
  *   蓝灯 D3 = GPIO1，高电平点亮，指示链路状态（详见 link_rx.c 的 led_update）
  *   按键 S1 = GPIO0，按下为低。既是 BOOT 键，也用来在串口上打一行状态
@@ -36,6 +40,7 @@
 #include "esp_system.h"
 #include "nvs_flash.h"
 
+#include "hid_key.h"
 #include "link_rx.h"
 #include "uac_mic.h"
 
@@ -61,6 +66,11 @@ void app_main(void)
     /* UAC 要先起来：link_rx 的接收回调一开始工作就会往抖动缓冲里塞 PCM。
      * 这一步会把 USB PHY 从 Serial/JTAG 切给 OTG，之后 COM 口就消失了 */
     ESP_ERROR_CHECK(uac_mic_init());
+
+    /* HID 键盘任务。必须排在 uac_mic_init() 之后（那一步才把 TinyUSB 拉起来），
+     * 也必须排在 link_rx_start() 之前 —— 链路一通就可能收到唤醒事件，
+     * 那时队列得已经存在，否则头几次按键会被静默丢掉 */
+    ESP_ERROR_CHECK(hid_key_start());
 
     ESP_ERROR_CHECK(link_rx_start());
 

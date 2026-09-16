@@ -63,16 +63,74 @@ uint8_t const *tud_descriptor_device_cb(void)
 //--------------------------------------------------------------------+
 // Configuration Descriptor
 //--------------------------------------------------------------------+
-#define CONFIG_TOTAL_LEN        (TUD_CONFIG_DESC_LEN + CFG_TUD_AUDIO * TUD_AUDIO_DEVICE_DESC_LEN)
 #define EPNUM_AUDIO_OUT   0x01
 #define EPNUM_AUDIO_FB    0x81
 #define EPNUM_AUDIO_IN    0x82
+
+/* ===== 本地修改 #3：HID 键盘接口 =====
+ *
+ * 端点选 0x83：音频只占了 0x82(IN)，0x81 虽然名义上留给反馈端点、但纯麦克风
+ * 模式下不会出现在描述符里。避开它纯粹是图省心——万一以后把扬声器打开，
+ * 反馈端点就要用 0x81 了，那时不用再回来挪 HID。
+ *
+ * 轮询间隔 10ms：按键这种事件 10ms 的粒度远远够了，再快只是白占带宽。 */
+#if UAC_HID_KEY_ENABLE
+
+#define EPNUM_HID         0x83
+#define HID_POLL_MS       10
+
+/* 一份标准键盘报文描述符，不带 Report ID。
+ * 不带的好处是发报文时 report_id 传 0 即可；一旦以后要再加别的
+ * （比如媒体键），就必须给每一份都加上 Report ID，两边一起改 */
+uint8_t const desc_hid_report[] = {
+    TUD_HID_REPORT_DESC_KEYBOARD()
+};
+
+// Invoked when received GET HID REPORT DESCRIPTOR
+uint8_t const *tud_hid_descriptor_report_cb(uint8_t instance)
+{
+    (void)instance;
+    return desc_hid_report;
+}
+
+/* 主机来读报文。键盘是纯输入设备，不需要主动被读，返回 0 让协议栈 STALL 掉即可。
+ * 注意这个回调必须存在 —— 声明了 HID 却不实现回调，控制请求会被 STALL，
+ * 表现和 README 第三节那个「本地修改 #2」一模一样：设备管理器里代码 10 */
+uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id,
+                               hid_report_type_t report_type,
+                               uint8_t *buffer, uint16_t reqlen)
+{
+    (void)instance; (void)report_id; (void)report_type; (void)buffer; (void)reqlen;
+    return 0;
+}
+
+/* 主机下发报文：键盘这边就是大小写锁定/数字锁定那几个 LED 的状态。
+ * dongle 上没有这些灯，收下不管。同样必须实现，理由同上 */
+void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id,
+                           hid_report_type_t report_type,
+                           uint8_t const *buffer, uint16_t bufsize)
+{
+    (void)instance; (void)report_id; (void)report_type; (void)buffer; (void)bufsize;
+}
+
+#define HID_DESC_LEN   TUD_HID_DESC_LEN
+#else
+#define HID_DESC_LEN   0
+#endif  // UAC_HID_KEY_ENABLE
+
+#define CONFIG_TOTAL_LEN        (TUD_CONFIG_DESC_LEN + CFG_TUD_AUDIO * TUD_AUDIO_DEVICE_DESC_LEN + HID_DESC_LEN)
 
 uint8_t const desc_configuration[] = {
     // Config number, interface count, string index, total length, attribute, power in mA
     TUD_CONFIG_DESCRIPTOR(1, ITF_NUM_TOTAL, 0, CONFIG_TOTAL_LEN, 0x00, 100),
     // Interface number, string index, EP Out & EP In address, EP size
     TUD_AUDIO_DESCRIPTOR(ITF_NUM_AUDIO_CONTROL, 4, EPNUM_AUDIO_OUT, EPNUM_AUDIO_IN, EPNUM_AUDIO_FB),
+#if UAC_HID_KEY_ENABLE
+    /* 接口号, 字符串索引(0=不给名字), 启动协议, 报文描述符长度, 端点, 端点大小, 轮询间隔 */
+    TUD_HID_DESCRIPTOR(ITF_NUM_HID, 0, HID_ITF_PROTOCOL_KEYBOARD,
+                       sizeof(desc_hid_report), EPNUM_HID,
+                       CFG_TUD_HID_EP_BUFSIZE, HID_POLL_MS),
+#endif
 };
 
 // Invoked when received GET CONFIGURATION DESCRIPTOR

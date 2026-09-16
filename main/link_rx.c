@@ -16,6 +16,7 @@
 #include "esp_wifi.h"
 #include "sdkconfig.h"   /* CONFIG_TUSB_PRODUCT：横幅里要报出电脑上看到的设备名 */
 
+#include "hid_key.h"
 #include "link_rx.h"
 #include "uac_mic.h"
 
@@ -53,7 +54,7 @@ typedef struct __attribute__((packed)) {
     uint8_t  rsv;         /* 对端最近 1 秒的削顶占比 0~100 */
     int8_t   dbfs_full;   /* 高通之前、全频段 RMS */
     int8_t   dbfs_band;   /* 高通之后、语音带内 RMS */
-    uint8_t  wake;        /* 对端外接唤醒键的按下计数 */
+    uint8_t  wake;        /* 对端外接唤醒键(GPIO4)的按下计数，变了就敲一次空格 */
 } link_pkt_t;
 
 /* 音频包：8 字节头 + samples 个 int16 小端交织 PCM。
@@ -98,6 +99,18 @@ static int8_t   s_rssi;
 static uint16_t s_rx_last_seq;
 static bool     s_rx_seq_valid;
 static uint32_t s_rx_ok, s_rx_lost;
+
+/* 对端唤醒键。s_wake_last 是上一次看到的计数值，变了就置起 s_wake_pending，
+ * 由主循环取走去敲键盘。
+ *
+ * s_wake_valid 是"基准已建立"的标志，少了它会误触发两次：
+ *   - 刚配上对的第一包，计数值多半不是 0（对端可能已经开机很久），
+ *     没有基准就会被当成"变了"，一配上就自己敲一下空格
+ *   - 对端复位后计数从 0 重来，同样是一次"变化"
+ * 所以下面检测到对端复位时会把它清掉，重新建基准。 */
+static uint8_t  s_wake_last;
+static bool     s_wake_valid;
+static bool     s_wake_pending;
 
 static uint16_t s_tx_seq;
 
@@ -191,12 +204,25 @@ static void on_recv_status(const esp_now_recv_info_t *info, const uint8_t *data,
             s_rx_ok       = 1;
             s_rx_lost     = 0;
             s_rx_last_seq = p.seq;
+            /* 对端复位了，wake 计数从 0 重来。不清基准的话这一下会被当成
+             * 按了一次唤醒键，电脑那头莫名其妙收到一个空格 */
+            s_wake_valid  = false;
         }
     } else {
         s_rx_seq_valid = true;
         s_rx_last_seq  = p.seq;
         s_rx_ok        = 1;
         s_rx_lost      = 0;
+    }
+
+    /* 唤醒键：只看"变没变"，不看变了多少。对端每 60ms 把当前计数重发一遍，
+     * 所以哪怕丢几包，新值也会跟着后面的包过来，最多晚一拍 */
+    if (!s_wake_valid) {
+        s_wake_last  = p.wake;
+        s_wake_valid = true;
+    } else if (p.wake != s_wake_last) {
+        s_wake_last    = p.wake;
+        s_wake_pending = true;
     }
 
     s_remote_level   = (p.level > 100) ? 100 : p.level;
@@ -485,8 +511,11 @@ static void link_task(void *arg)
         bool     remote_has_mic;
         uint32_t rx_ok, rx_lost;
 
+        bool wake_hit;
+
         portENTER_CRITICAL(&s_mux);
         pending_pair = s_pending_pair; s_pending_pair = false;
+        wake_hit     = s_wake_pending; s_wake_pending = false;
         memcpy(pending_mac, s_pending_mac, 6);
         paired         = s_paired;
         last_rx_us     = s_last_rx_us;
@@ -556,13 +585,24 @@ static void link_task(void *arg)
             esp_now_send(dst, (const uint8_t *)&p, sizeof(p));
         }
 
+        /* ---- 对端唤醒键 -> 电脑上的一次空格 ----
+         * 放在主循环而不是回调里：敲一次键要按下、等 20ms、再松开，
+         * 回调里绝不能阻塞。hid_key_tap_space() 只是塞个请求就返回 */
+        if (wake_hit) {
+            hid_key_tap_space();
+            printf("\n[唤醒键] 对端按下 -> 已向电脑发送空格键%s\n\n",
+                   hid_key_ready() ? "" : "  —— 但 USB 没就绪，这一下会被丢掉");
+        }
+
         /* ---- BOOT 键：不接电脑时也能确认固件活着 ---- */
         bool down = (gpio_get_level(BTN_GPIO) == 0);
         if (down && !btn_down) {
-            printf("\n[按键] 缓冲%dms | 电脑%s | 欠载%" PRIu32 " 追帧%" PRIu32 "\n\n",
+            printf("\n[按键] 缓冲%dms | 电脑%s | 欠载%" PRIu32 " 追帧%" PRIu32
+                   " | 空格已发%" PRIu32 " 丢%" PRIu32 "\n\n",
                    uac_mic_depth_ms(),
                    uac_mic_host_active() ? "正在录音" : "没在录音",
-                   uac_mic_underruns(), uac_mic_catchups());
+                   uac_mic_underruns(), uac_mic_catchups(),
+                   hid_key_sent(), hid_key_dropped());
         }
         btn_down = down;
 

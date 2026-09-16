@@ -99,6 +99,15 @@ extern "C" {
 #define CFG_TUD_ENDPOINT0_SIZE    64
 #endif
 
+/* 本地修改 #3：HID 键盘。
+ * CFG_TUD_HID 不定义的话 tusb_option.h 默认给 0，类驱动整个不编译，
+ * tud_hid_keyboard_report() 会变成未定义符号 */
+#if UAC_HID_KEY_ENABLE
+#define CFG_TUD_HID             1
+/* 键盘报文是 8 字节（修饰键 + 保留 + 6 个键码），16 够用还有余量 */
+#define CFG_TUD_HID_EP_BUFSIZE  16
+#endif
+
 #ifdef __cplusplus
 }
 #endif

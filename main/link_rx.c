@@ -54,7 +54,7 @@ typedef struct __attribute__((packed)) {
     uint8_t  rsv;         /* 对端最近 1 秒的削顶占比 0~100 */
     int8_t   dbfs_full;   /* 高通之前、全频段 RMS */
     int8_t   dbfs_band;   /* 高通之后、语音带内 RMS */
-    uint8_t  wake;        /* 对端外接唤醒键(GPIO4)的按下计数，变了就敲一次空格 */
+    uint8_t  wake;        /* 对端外接唤醒键(GPIO4)的按下计数，变了就敲一次回车 */
 } link_pkt_t;
 
 /* 音频包：8 字节头 + samples 个 int16 小端交织 PCM。
@@ -105,7 +105,7 @@ static uint32_t s_rx_ok, s_rx_lost;
  *
  * s_wake_valid 是"基准已建立"的标志，少了它会误触发两次：
  *   - 刚配上对的第一包，计数值多半不是 0（对端可能已经开机很久），
- *     没有基准就会被当成"变了"，一配上就自己敲一下空格
+ *     没有基准就会被当成"变了"，一配上就自己敲一下回车
  *   - 对端复位后计数从 0 重来，同样是一次"变化"
  * 所以下面检测到对端复位时会把它清掉，重新建基准。 */
 static uint8_t  s_wake_last;
@@ -119,6 +119,19 @@ static uint16_t s_tx_seq;
 static uint32_t s_aud_rx;        /* 收到的音频包数 */
 static uint32_t s_aud_lost;      /* 按序号差算出来的空口丢包 */
 static uint32_t s_aud_bad;       /* 长度/通道数不合法而丢弃 */
+static uint32_t s_aud_filled;    /* 因为丢包而补进去的静音包数 */
+
+/* 丢包补位的上限，按包算。10 包 = 200ms。
+ *
+ * 为什么要补位：电脑按固定速率取数，少来一包缓冲就永久浅 20ms。不补的话
+ * 100ms 的起播垫子会被丢包一点点吃光（0.3% 丢包率下大约半分钟），之后每次
+ * 网络抖动都直接变成断续。补上静音，缓冲深度就和丢包无关了，
+ * 静音也正好落在丢包的位置，录音的时间轴是对的。
+ *
+ * 为什么要有上限：断得太久（超过 200ms 但还不到 1.2 秒的失联判定）时，
+ * 一口气补几百毫秒静音会把缓冲顶到高水位，接下来又要丢块追延迟。
+ * 不如直接清空重新起播 */
+#define AUD_FILL_MAX_PKTS  10
 static uint16_t s_aud_last_seq;
 static bool     s_aud_seq_valid;
 
@@ -205,7 +218,7 @@ static void on_recv_status(const esp_now_recv_info_t *info, const uint8_t *data,
             s_rx_lost     = 0;
             s_rx_last_seq = p.seq;
             /* 对端复位了，wake 计数从 0 重来。不清基准的话这一下会被当成
-             * 按了一次唤醒键，电脑那头莫名其妙收到一个空格 */
+             * 按了一次唤醒键，电脑那头莫名其妙收到一个回车 */
             s_wake_valid  = false;
         }
     } else {
@@ -273,10 +286,13 @@ static void on_recv_audio(const esp_now_recv_info_t *info, const uint8_t *data, 
         return;
     }
 
+    uint16_t missing = 0;     /* 这一包之前缺了几包，下面按它补位 */
+
     if (s_aud_seq_valid) {
         int16_t d = (int16_t)(hdr.seq - s_aud_last_seq);
         if (d > 0) {
-            s_aud_lost += (uint32_t)(d - 1);
+            missing = (uint16_t)(d - 1);
+            s_aud_lost += missing;
             s_aud_last_seq = hdr.seq;
         } else if (d < -8) {          /* 对端复位了 */
             s_aud_lost     = 0;
@@ -333,7 +349,23 @@ static void on_recv_audio(const esp_now_recv_info_t *info, const uint8_t *data, 
     s_peak16 = peak;
     s_gain_n += hdr.samples;
 
-    uac_mic_push(gained, (size_t)hdr.samples * sizeof(int16_t));
+    size_t bytes = (size_t)hdr.samples * sizeof(int16_t);
+
+    /* 先补缺的包，再写这一包 —— 顺序反了静音就落到了错的位置。
+     * 按当前包的长度补：两端的每包帧数是编译期定死的，丢的那几包和这一包一样长 */
+    if (missing > 0) {
+        if (missing <= AUD_FILL_MAX_PKTS) {
+            static const int16_t silence[LINK_FRAMES_PKT * LINK_MIC_CHANNELS] = {0};
+            for (uint16_t i = 0; i < missing; i++) {
+                uac_mic_push(silence, bytes);
+            }
+            s_aud_filled += missing;
+        } else {
+            uac_mic_flush();   /* 断太久，补位没意义，清空重新起播 */
+        }
+    }
+
+    uac_mic_push(gained, bytes);
 }
 
 static void on_recv(const esp_now_recv_info_t *info, const uint8_t *data, int len)
@@ -585,12 +617,12 @@ static void link_task(void *arg)
             esp_now_send(dst, (const uint8_t *)&p, sizeof(p));
         }
 
-        /* ---- 对端唤醒键 -> 电脑上的一次空格 ----
+        /* ---- 对端唤醒键 -> 电脑上的一次回车 ----
          * 放在主循环而不是回调里：敲一次键要按下、等 20ms、再松开，
-         * 回调里绝不能阻塞。hid_key_tap_space() 只是塞个请求就返回 */
+         * 回调里绝不能阻塞。hid_key_tap() 只是塞个请求就返回 */
         if (wake_hit) {
-            hid_key_tap_space();
-            printf("\n[唤醒键] 对端按下 -> 已向电脑发送空格键%s\n\n",
+            hid_key_tap();
+            printf("\n[唤醒键] 对端按下 -> 已向电脑发送回车键%s\n\n",
                    hid_key_ready() ? "" : "  —— 但 USB 没就绪，这一下会被丢掉");
         }
 
@@ -598,7 +630,7 @@ static void link_task(void *arg)
         bool down = (gpio_get_level(BTN_GPIO) == 0);
         if (down && !btn_down) {
             printf("\n[按键] 缓冲%dms | 电脑%s | 欠载%" PRIu32 " 追帧%" PRIu32
-                   " | 空格已发%" PRIu32 " 丢%" PRIu32 "\n\n",
+                   " | 按键已发%" PRIu32 " 丢%" PRIu32 "\n\n",
                    uac_mic_depth_ms(),
                    uac_mic_host_active() ? "正在录音" : "没在录音",
                    uac_mic_underruns(), uac_mic_catchups(),
@@ -622,13 +654,14 @@ static void link_task(void *arg)
 
                 /* 整行先拼进缓冲再一次性输出。分成多次调用的话，每次都要单独
                  * 抢一次输出锁，中间可能被别的任务插进来，一行就断成好几截 */
-                char   line[256];
+                char   line[384];   /* 中文每字 3 字节，256 在各项都出现时会截断行尾 */
                 size_t n = 0;
                 n += snprintf(line + n, sizeof(line) - n,
-                              " 音频 收%" PRIu32 " 空口丢%" PRIu32 " 非法%" PRIu32
+                              " 音频 收%" PRIu32 " 空口丢%" PRIu32 " 补位%" PRIu32
+                              " 非法%" PRIu32
                               " | 缓冲%3dms 欠载%" PRIu32 " 追帧%" PRIu32 " 满丢%" PRIu32
                               " | RSSI%4d 心跳%5.1f%%",
-                              s_aud_rx, s_aud_lost, s_aud_bad,
+                              s_aud_rx, s_aud_lost, s_aud_filled, s_aud_bad,
                               uac_mic_depth_ms(), uac_mic_underruns(),
                               uac_mic_catchups(), uac_mic_drops(),
                               rssi, hb_rate);
@@ -638,7 +671,7 @@ static void link_task(void *arg)
                                   remote_level, remote_full, remote_band);
                     if (remote_clip > 0 && n < sizeof(line)) {
                         n += snprintf(line + n, sizeof(line) - n,
-                                      "  << 削顶%d%%! 降对端 PCM_GAIN_SHIFT", remote_clip);
+                                      "  << 对端削顶%d%%（离麦太近或声音接近满量程）", remote_clip);
                     }
                 } else if (n < sizeof(line)) {
                     n += snprintf(line + n, sizeof(line) - n, "  << 远端没有麦克风!");

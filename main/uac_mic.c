@@ -32,16 +32,45 @@ static const char *TAG = "uac";
  * 太短会把正常的网络抖动误判成欠载，太长则链路断了之后 USB 那头会卡顿 */
 #define WAIT_MS       (INTERVAL_MS * 2 + 5)
 
+/* 两次取数间隔超过这么久，就认为电脑是「重新开始录音」。
+ *
+ * 正常录音时 10ms 取一次；停止录音后取数任务整个停下来，间隔是几秒到几小时。
+ * 取 200ms 而不是更短：CPU 偶尔卡一下、USB 偶尔慢一帧都可能让间隔到几十毫秒，
+ * 门限太低会在正常录音中途误清缓冲，凭空插进一段 100ms 的起播空白 */
+#define SESSION_GAP_MS 200
+
 static StreamBufferHandle_t s_pcm = NULL;
+
+/* 下面两个标志都只由取数任务（唯一的读者）来执行清空。
+ * s_prebuffering 只在取数任务里读写；s_reset_req 由别的任务置位、取数任务清零 */
 static volatile bool        s_prebuffering = true;
+static volatile bool        s_reset_req;
 
 static volatile uint32_t s_underruns;
 static volatile uint32_t s_drops;
 static volatile uint32_t s_catchups;
 
 /* 主机有没有在录音。组件没把 mic_active 暴露出来，所以用"最近一次被要数据
- * 是什么时候"来推断 —— 主机一停止录音，input_cb 就不再被调用了 */
+ * 是什么时候"来推断 —— 主机一停止录音，input_cb 就不再被调用了。
+ * 初值 0 让第一次取数也被判成「新会话」，插上电脑后的第一次录音同样要清旧数据 */
 static volatile int64_t s_last_pull_us;
+
+/* 读空缓冲并重新进入预缓冲。【只能在取数任务里调】。
+ *
+ * FreeRTOS 流缓冲只保证「一个读者 + 一个写者」安全，它的读指针更新不是原子的。
+ * 以前 uac_mic_flush() 在链路任务里直接读，和取数任务就成了两个读者。
+ * 现在别的任务只置 s_reset_req，真正的读空都收到这里做。
+ *
+ * 128 字节一读不会破坏采样对齐：循环一直读到返回 0 为止，读完缓冲是空的，
+ * 下一包写进来又是从整包边界开始 */
+static void drain_and_rebuffer(void)
+{
+    uint8_t junk[128];
+    while (xStreamBufferReceive(s_pcm, junk, sizeof(junk), 0) > 0) {
+        /* 空转到读干净为止 */
+    }
+    s_prebuffering = true;
+}
 
 /* ---------------- UAC 取数回调 ---------------- */
 
@@ -54,7 +83,22 @@ static esp_err_t uac_input_cb(uint8_t *buf, size_t len, size_t *bytes_read, void
 {
     (void)ctx;
 
-    s_last_pull_us = esp_timer_get_time();
+    int64_t now     = esp_timer_get_time();
+    bool    new_ses = (now - s_last_pull_us) > SESSION_GAP_MS * 1000LL;
+    s_last_pull_us  = now;
+
+    /* ---- 电脑刚(重新)开始录音，或者链路任务请求清空 ----
+     *
+     * 电脑停止录音后没人取数，ESP-NOW 却还在往里写：缓冲零点几秒就满，之后新包
+     * 整包丢弃，留在里面的是「停止录音那一刻」的旧音频。不清的话，下一次开始录音
+     * （可能是几小时后）开头交给电脑的就是这段旧声音 —— 对每说一句就开关一次
+     * 麦克风的语音识别软件，等于每一句开头都拼上上一句的尾巴。
+     *
+     * 先清标志再读空：清完之后才到的请求，对应的数据也会被这次读空一并带走 */
+    if (new_ses || s_reset_req) {
+        s_reset_req = false;
+        drain_and_rebuffer();
+    }
 
     /* ---- 预缓冲：只等，不消费 ---- */
     if (s_prebuffering) {
@@ -86,6 +130,17 @@ static esp_err_t uac_input_cb(uint8_t *buf, size_t len, size_t *bytes_read, void
          * 少交的这一段在录音里就是一个空洞，补零至少能保持时长对齐 */
         memset(buf + got, 0, len - got);
         s_underruns++;
+
+        /* 并且重新攒够 PREBUF_MS 再继续交付。
+         *
+         * 缓冲见底说明抗抖动的垫子已经用完了。如果只补这 10ms 就接着交，缓冲会
+         * 一直贴着 0 运行，之后 ESP-NOW 每晚到一次都直接变成一次断续，而且永远
+         * 恢复不过来。重新起播的代价是这一次多空 100ms，换来之后又有完整的垫子。
+         *
+         * 丢包已经在 link_rx.c 里按序号补了静音，不会再慢慢吃掉垫子；
+         * 所以正常情况下这里很少触发，触发了多半是两边时钟漂移积累到头，
+         * 或者空口断流超过了 200ms 的补位上限 */
+        s_prebuffering = true;
     }
 
     *bytes_read = len;
@@ -111,17 +166,12 @@ bool uac_mic_push(const void *pcm, size_t bytes)
 
 void uac_mic_flush(void)
 {
-    if (s_pcm == NULL) {
-        return;
-    }
-    /* 用"读空"而不是 xStreamBufferReset()：reset 会重置读写指针，
-     * 万一此刻 UAC 任务正好在读就会撞出错乱的索引；
-     * 而单读单写下的非阻塞 receive 本来就是线程安全的 */
-    uint8_t junk[128];
-    while (xStreamBufferReceive(s_pcm, junk, sizeof(junk), 0) > 0) {
-        /* 空转到读干净为止 */
-    }
-    s_prebuffering = true;
+    /* 这里只置标志，不直接读：调用方是链路任务 / WiFi 任务，而取数任务同时也在读
+     * 这个流缓冲，两个读者会把读指针写乱。交给取数任务下次进来时自己清。
+     *
+     * 电脑没在录音时取数任务不跑，标志会一直留着 —— 没关系，等电脑开始录音时
+     * 本来就会按「新会话」清一遍 */
+    s_reset_req = true;
 }
 
 bool uac_mic_host_active(void)

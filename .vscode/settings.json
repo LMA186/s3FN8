@@ -21,5 +21,5 @@
         "editor.tabSize": 4,
         "editor.insertSpaces": true
     },
-    "idf.portWin": "COM17"
+    "idf.port": "COM17"
 }

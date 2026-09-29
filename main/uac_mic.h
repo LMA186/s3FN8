@@ -60,9 +60,14 @@ esp_err_t uac_mic_init(void);
 bool uac_mic_push(const void *pcm, size_t bytes);
 
 /**
- * @brief 链路断了的时候调用：丢掉缓冲里的陈音频并重新进入预缓冲
+ * @brief 请求丢掉缓冲里的陈音频并重新进入预缓冲
  *
- * 不清的话，恢复之后那几百毫秒的旧声音会一直顶在前面，延迟再也降不下来。
+ * 链路断了、或者空口断流太久补不了位时调用。不清的话，恢复之后那几百毫秒
+ * 的旧声音会一直顶在前面，延迟再也降不下来。
+ *
+ * 可以在任何任务里调。它只置一个标志，真正的清空由 UAC 取数任务下一次
+ * 进来时执行（流缓冲只允许一个读者）。电脑没在录音时不会立即执行，
+ * 但电脑开始录音时本来就会清一次，结果一样。
  */
 void uac_mic_flush(void);
 
@@ -70,7 +75,7 @@ void uac_mic_flush(void);
 bool uac_mic_host_active(void);
 
 /* ---- 统计，串口状态行用 ---- */
-uint32_t uac_mic_underruns(void);   /* 缓冲空，交了静音的次数 */
+uint32_t uac_mic_underruns(void);   /* 缓冲见底、交静音并重新起播的次数。每 +1 ≈ 一处 100ms 断口 */
 uint32_t uac_mic_drops(void);       /* 缓冲满，整包丢弃的次数 */
 uint32_t uac_mic_catchups(void);    /* 超高水位，主动丢块追延迟的次数 */
 int      uac_mic_depth_ms(void);    /* 当前缓冲深度，毫秒 */

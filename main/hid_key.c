@@ -1,5 +1,5 @@
 /*
- * HID 键盘：把对端唤醒键变成电脑上的一次空格
+ * HID 键盘：把对端唤醒键变成电脑上的一次按键（当前是回车）
  *
  * 为什么要单独一个任务，而不是收到事件就地调 tud_hid_keyboard_report：
  *   一次完整的按键是「按下 -> 保持一小会 -> 松开」两份报文。中间必须有间隔，
@@ -7,7 +7,8 @@
  *   靠 delay，绝不能在 ESP-NOW 回调或 20ms 的主循环里 delay。
  *
  *   更要紧的是那份「松开」报文不能省：不发的话电脑认为这个键一直按着，
- *   系统级的按键重复会开始工作，一秒钟几十个空格灌进当前窗口。
+ *   系统级的按键重复会开始工作，一秒钟几十次按键灌进当前窗口 ——
+ *   回车比空格更要命，聊天窗口里就是连发几十条消息。
  */
 
 #include <inttypes.h>
@@ -27,12 +28,23 @@
 
 static const char *TAG = "hid";
 
+/* 敲哪个键。全工程只有这一处定义，换键改这两行就够。
+ *
+ * 键码表在 TinyUSB 的 hid.h 里，常用的几个：
+ *   HID_KEY_ENTER  回车    HID_KEY_SPACE  空格    HID_KEY_TAB  制表
+ *   HID_KEY_F13    F13（Windows 不占用，适合留给软件自己绑热键）
+ *
+ * 想发组合键（比如 Ctrl+Shift+M）的话，改 tud_hid_keyboard_report 的第二个参数
+ * （修饰键位掩码，如 KEYBOARD_MODIFIER_LEFTCTRL | KEYBOARD_MODIFIER_LEFTSHIFT） */
+#define TAP_KEYCODE     HID_KEY_ENTER
+#define TAP_KEYNAME     "回车"
+
 /* 按下到松开之间的保持时间。太短电脑可能识别不到，太长会触发按键重复。
  * 20ms 约等于人手最快的一次点按，各系统都稳 */
 #define KEY_HOLD_MS     20
 
-/* 队列深度 1：连按时不排队。空格是个动作触发，积压几十个补发出去
- * 只会让电脑那头莫名其妙连翻几页，不如丢掉 */
+/* 队列深度 1：连按时不排队。这个键是个动作触发，积压几十个补发出去
+ * 只会让电脑那头莫名其妙连着执行几十次，不如丢掉 */
 #define KEY_QUEUE_LEN   1
 
 /* 主机挂起后唤醒它要走一次总线恢复，给的等待上限。超时就放弃这一次 */
@@ -75,20 +87,21 @@ static void hid_key_task(void *arg)
 
         if (!tud_mounted() || !wait_hid_ready(50)) {
             s_dropped++;
-            ESP_LOGW(TAG, "USB 没就绪，丢弃一次空格（累计 %" PRIu32 " 次）", s_dropped);
+            ESP_LOGW(TAG, "USB 没就绪，丢弃一次" TAP_KEYNAME "（累计 %" PRIu32 " 次）",
+                     s_dropped);
             continue;
         }
 
         /* 按下。keycode 是个 6 键数组（USB 键盘天生支持同时按 6 个键），
          * 我们只用第一个，其余填 0 表示"没有别的键被按着" */
-        uint8_t keycode[6] = { HID_KEY_SPACE, 0, 0, 0, 0, 0 };
-        tud_hid_keyboard_report(0, 0, keycode);
+        uint8_t keycode[6] = { TAP_KEYCODE, 0, 0, 0, 0, 0 };
+        tud_hid_keyboard_report(0, 0, keycode);   /* 第二个参数是修饰键，0 = 不按 Ctrl/Shift */
 
         vTaskDelay(pdMS_TO_TICKS(KEY_HOLD_MS));
 
-        /* 松开。这一份必须发出去，宁可多等一会 —— 漏了就是满屏空格 */
+        /* 松开。这一份必须发出去，宁可多等一会 —— 漏了电脑就认为键一直按着 */
         if (!wait_hid_ready(200)) {
-            ESP_LOGE(TAG, "松开报文发不出去，电脑那头可能会连续输入空格");
+            ESP_LOGE(TAG, "松开报文发不出去，电脑那头可能会连续输入" TAP_KEYNAME);
         }
         tud_hid_keyboard_report(0, 0, NULL);
 
@@ -113,7 +126,7 @@ esp_err_t hid_key_start(void)
     return ESP_OK;
 }
 
-void hid_key_tap_space(void)
+void hid_key_tap(void)
 {
     if (s_q == NULL) {
         return;
@@ -134,7 +147,7 @@ bool     hid_key_ready(void)   { return tud_mounted() && tud_hid_ready(); }
 /* 关掉 HID 时的空实现。link_rx.c 里的调用是无条件编译的，
  * 少一个就是链接错误 */
 esp_err_t hid_key_start(void)  { return ESP_OK; }
-void     hid_key_tap_space(void) { }
+void     hid_key_tap(void)     { }
 uint32_t hid_key_sent(void)    { return 0; }
 uint32_t hid_key_dropped(void) { return 0; }
 bool     hid_key_ready(void)   { return false; }
